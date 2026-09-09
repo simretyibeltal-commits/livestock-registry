@@ -1,231 +1,130 @@
 pipeline {
     agent any
-    environment {
-        AWS_REGION   = 'ap-south-1'
-        ECR_BASE     = 'oan/livestock-registry'
-        RP_VERSION   = '0.0.0-develop.296'
-        NAMESPACE    = 'live'
-        RELEASE_NAME = 'livestock-registry'
+
+    parameters {
+     
+        booleanParam(name: 'DEPLOY_TO_LIVE', defaultValue: false,
+            description: 'Also run the Deploy stage against the live namespace. Leave OFF until the first chart-switch cutover has been done deliberately.')
     }
+
+    environment {
+        AWS_ACCOUNT_ID = "${env.AWS_ACCOUNT_ID}"
+        AWS_REGION     = "ap-south-1"
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_PATH       = "openg2p/livestock-registry"
+
+        RP_VERSION     = "0.0.0-develop.296"
+
+        HELM_RELEASE   = "livestock-registry"
+        HELM_NAMESPACE = "live"
+        HELM_CHART_DIR = "helm/openg2p-livestock-registry"
+    }
+
     stages {
         stage('Checkout') {
             steps { checkout scm }
         }
-        stage('Build Images') {
+
+        stage('ECR Login') {
             steps {
-                withCredentials([string(credentialsId: 'AWS_ACCOUNT_ID', variable: 'AWS_ACCOUNT_ID')]) {
-                    sh '''
-                        ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-                        BRANCH="${BRANCH_NAME}"
-                        TAG="${BRANCH}-${BUILD_NUMBER}"
-                        echo "=== Building images for branch: ${BRANCH} tag: ${TAG} ==="
-                        # staff-api
-                        docker build \
-                            --build-arg RP_VERSION=${RP_VERSION} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/staff-api:${TAG} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/staff-api:${BRANCH} \
-                            --file docker/staff-api/Dockerfile \
-                            --no-cache .
-                        # celery
-                        docker build \
-                            --build-arg RP_VERSION=${RP_VERSION} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/celery:${TAG} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/celery:${BRANCH} \
-                            --file docker/celery/Dockerfile \
-                            --no-cache .
-                        # db-seed
-                        docker build \
-                            --build-arg RP_VERSION=${RP_VERSION} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/db-seed:${TAG} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/db-seed:${BRANCH} \
-                            --file docker/db-seed/Dockerfile \
-                            --no-cache .
-                        # partner-api
-                        docker build \
-                            --build-arg RP_VERSION=${RP_VERSION} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/partner-api:${TAG} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/partner-api:${BRANCH} \
-                            --file docker/partner-api/Dockerfile \
-                            --no-cache .
-                        # sanity-tests
-                        docker build \
-                            --build-arg RP_VERSION=${RP_VERSION} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/sanity-tests:${TAG} \
-                            --tag ${ECR_REGISTRY}/${ECR_BASE}/sanity-tests:${BRANCH} \
-                            --file docker/sanity-tests/Dockerfile \
-                            --no-cache .
-                        echo "=== All images built ==="
-                    '''
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-ecr-creds']]) {
+                    sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
                 }
             }
         }
-        stage('Push to ECR') {
+
+        stage('Build & Push Images') {
+          
             steps {
-                withCredentials([string(credentialsId: 'AWS_ACCOUNT_ID', variable: 'AWS_ACCOUNT_ID')]) {
-                    sh '''
-                        ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-                        BRANCH="${BRANCH_NAME}"
-                        TAG="${BRANCH}-${BUILD_NUMBER}"
-                        echo "=== Logging in to ECR ==="
-                        aws ecr get-login-password --region ${AWS_REGION} | \
-                            docker login --username AWS --password-stdin ${ECR_REGISTRY}
-                        echo "=== Pushing images ==="
-                        for SVC in staff-api celery db-seed partner-api sanity-tests; do
-                            docker push ${ECR_REGISTRY}/${ECR_BASE}/${SVC}:${TAG}
-                            docker push ${ECR_REGISTRY}/${ECR_BASE}/${SVC}:${BRANCH}
-                            echo "Pushed ${SVC}:${TAG}"
-                        done
-                        echo "=== Cleanup local images ==="
-                        for SVC in staff-api celery db-seed partner-api sanity-tests; do
-                            docker rmi ${ECR_REGISTRY}/${ECR_BASE}/${SVC}:${TAG} || true
-                            docker rmi ${ECR_REGISTRY}/${ECR_BASE}/${SVC}:${BRANCH} || true
-                        done
-                        docker system prune -f || true
-                        echo "=== All images pushed ==="
-                    '''
+                script {
+                    env.IMAGE_TAG = env.GIT_COMMIT.take(12)
+
+                    def components = ['staff-api', 'partner-api', 'celery', 'db-seed', 'sanity-tests']
+
+                    components.each { name ->
+                        def image  = "${ECR_REGISTRY}/${ECR_PATH}/${name}:${env.IMAGE_TAG}"
+                        def latest = "${ECR_REGISTRY}/${ECR_PATH}/${name}:develop"
+                        sh """
+                            docker build --build-arg RP_VERSION=${RP_VERSION} \
+                                -f docker/${name}/Dockerfile -t ${image} -t ${latest} .
+                            docker push ${image}
+                            docker push ${latest}
+                        """
+                    }
                 }
             }
         }
-        stage('Deploy to Dev') {
-            when { branch 'develop' }
-            agent { label 'vpn-deploy-agent' }
+
+        stage('Stash chart') {
+            
             steps {
-                withCredentials([
-                    string(credentialsId: 'AWS_ACCOUNT_ID', variable: 'AWS_ACCOUNT_ID'),
-                    file(credentialsId: 'gen2-kubeconfig', variable: 'KUBECONFIG')
-                ]) {
-                    sh '''
-                        ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-                        BRANCH="${BRANCH_NAME}"
-                        TAG="${BRANCH}-${BUILD_NUMBER}"
-                        echo "=== Deploying to live namespace ==="
-                        helm repo add openg2p-gitlab \
-                            https://gitlab.com/api/v4/projects/84460547/packages/helm/stable || true
-                        helm dependency build ./helm/openg2p-livestock-registry
-                        helm upgrade --install ${RELEASE_NAME} ./helm/openg2p-livestock-registry \
-                            --namespace live \
-                            --create-namespace \
-                            --timeout 10m \
-                            --set registry.staffApi.image.repository=${ECR_REGISTRY}/${ECR_BASE}/staff-api \
-                            --set registry.staffApi.image.tag=${TAG} \
-                            --set registry.partnerApi.image.repository=${ECR_REGISTRY}/${ECR_BASE}/partner-api \
-                            --set registry.partnerApi.image.tag=${TAG} \
-                            --set registry.celeryWorker.image.repository=${ECR_REGISTRY}/${ECR_BASE}/celery \
-                            --set registry.celeryWorker.image.tag=${TAG} \
-                            --set registry.celeryBeat.image.repository=${ECR_REGISTRY}/${ECR_BASE}/celery \
-                            --set registry.celeryBeat.image.tag=${TAG} \
-                            --set registry.dbSeed.image.repository=${ECR_REGISTRY}/${ECR_BASE}/db-seed \
-                            --set registry.dbSeed.image.tag=${TAG} \
-                            --set registry.sanity.image.repository=${ECR_REGISTRY}/${ECR_BASE}/sanity-tests \
-                            --set registry.sanity.image.tag=${TAG}
-                        echo "=== Waiting for rollout ==="
-                        kubectl rollout status deployment/${RELEASE_NAME}-staff-api \
-                            -n live --timeout=120s || true
-                        echo "=== Deployment status ==="
-                        kubectl get pods -n live | grep ${RELEASE_NAME}
-                    '''
+                stash name: 'livestock-chart', includes: "${HELM_CHART_DIR}/**"
+            }
+        }
+
+        stage('Deploy to Staging (live namespace)') {
+            when {
+                allOf {
+                    branch 'develop'
+                    expression { return params.DEPLOY_TO_LIVE }
+                }
+            }
+           
+            agent { label 'vpn-agent2' }
+            steps {
+                unstash 'livestock-chart'
+                withCredentials([file(credentialsId: 'staging-rke2-kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh """
+                        helm dependency build ${HELM_CHART_DIR}
+
+                        cat > /tmp/values-live-cicd-\${BUILD_NUMBER}.yaml <<EOF
+registry:
+  staffApi:
+    image:
+      repository: ${ECR_REGISTRY}/${ECR_PATH}/staff-api
+      tag: "${env.IMAGE_TAG}"
+  partnerApi:
+    image:
+      repository: ${ECR_REGISTRY}/${ECR_PATH}/partner-api
+      tag: "${env.IMAGE_TAG}"
+  celeryWorker:
+    image:
+      repository: ${ECR_REGISTRY}/${ECR_PATH}/celery
+      tag: "${env.IMAGE_TAG}"
+  celeryBeat:
+    image:
+      repository: ${ECR_REGISTRY}/${ECR_PATH}/celery
+      tag: "${env.IMAGE_TAG}"
+  dbSeed:
+    image:
+      repository: ${ECR_REGISTRY}/${ECR_PATH}/db-seed
+      tag: "${env.IMAGE_TAG}"
+  sanity:
+    image:
+      repository: ${ECR_REGISTRY}/${ECR_PATH}/sanity-tests
+      tag: "${env.IMAGE_TAG}"
+EOF
+
+                        # Dry-run render + diff BEFORE the real upgrade/install.
+                        
+                        helm get values ${HELM_RELEASE} -n ${HELM_NAMESPACE} -a -o yaml > /tmp/live-values-current-\${BUILD_NUMBER}.yaml || true
+                        helm template ${HELM_RELEASE} ${HELM_CHART_DIR} -n ${HELM_NAMESPACE} -f /tmp/values-live-cicd-\${BUILD_NUMBER}.yaml > /tmp/live-new-\${BUILD_NUMBER}.yaml
+                        echo "Rendered \$(wc -l < /tmp/live-new-\${BUILD_NUMBER}.yaml) lines from this repo's own chart -- review against /tmp/live-values-current-\${BUILD_NUMBER}.yaml before trusting an automatic first run."
+
+                        helm upgrade --install ${HELM_RELEASE} ${HELM_CHART_DIR} -n ${HELM_NAMESPACE} \
+                            -f /tmp/values-live-cicd-\${BUILD_NUMBER}.yaml --timeout 20m
+                        kubectl rollout status deployment/livestock-registry-staff-portal-api -n ${HELM_NAMESPACE} --timeout=180s
+                        kubectl rollout status deployment/livestock-registry-partner-api -n ${HELM_NAMESPACE} --timeout=180s
+                    """
                 }
             }
         }
-        // stage('Deploy to Staging') {
-        //     when { branch 'main' }
-        //     steps {
-        //         withCredentials([
-        //             string(credentialsId: 'AWS_ACCOUNT_ID', variable: 'AWS_ACCOUNT_ID'),
-        //             file(credentialsId: 'dev-kubeconfig', variable: 'KUBECONFIG')
-        //         ]) {
-        //             input message: "Approve deployment of livestock-registry:${BRANCH_NAME}-${BUILD_NUMBER} to staging?"
-        //             sh '''
-        //                 ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-        //                 BRANCH="${BRANCH_NAME}"
-        //                 TAG="${BRANCH}-${BUILD_NUMBER}"
-        //                 echo "=== Deploying to staging namespace ==="
-        //                 helm repo add openg2p-gitlab \
-        //                     https://gitlab.com/api/v4/projects/84460547/packages/helm/stable || true
-        //                 helm dependency build ./helm/openg2p-livestock-registry
-        //                 helm upgrade --install ${RELEASE_NAME}-staging ./helm/openg2p-livestock-registry \
-        //                     --namespace ${NAMESPACE} \
-        //                     --timeout 10m \
-        //                     --set registry.staffApi.image.repository=${ECR_REGISTRY}/${ECR_BASE}/staff-api \
-        //                     --set registry.staffApi.image.tag=${TAG} \
-        //                     --set registry.partnerApi.image.repository=${ECR_REGISTRY}/${ECR_BASE}/partner-api \
-        //                     --set registry.partnerApi.image.tag=${TAG} \
-        //                     --set registry.celeryWorker.image.repository=${ECR_REGISTRY}/${ECR_BASE}/celery \
-        //                     --set registry.celeryWorker.image.tag=${TAG} \
-        //                     --set registry.celeryBeat.image.repository=${ECR_REGISTRY}/${ECR_BASE}/celery \
-        //                     --set registry.celeryBeat.image.tag=${TAG} \
-        //                     --set registry.dbSeed.image.repository=${ECR_REGISTRY}/${ECR_BASE}/db-seed \
-        //                     --set registry.dbSeed.image.tag=${TAG} \
-        //                     --set registry.sanity.image.repository=${ECR_REGISTRY}/${ECR_BASE}/sanity-tests \
-        //                     --set registry.sanity.image.tag=${TAG}
-        //                 echo "=== Waiting for rollout ==="
-        //                 kubectl rollout status deployment/${RELEASE_NAME}-staging-staff-api \
-        //                     -n ${NAMESPACE} --timeout=120s || true
-        //                 echo "=== Deployment status ==="
-        //                 kubectl get pods -n ${NAMESPACE} | grep ${RELEASE_NAME}-staging
-        //             '''
-        //         }
-        //     }
-        // }
     }
+
     post {
-        success {
-            script {
-                def committerEmail = sh(
-                    script: "git log -1 --pretty=format:'%ae'",
-                    returnStdout: true
-                ).trim()
-                def committerName = sh(
-                    script: "git log -1 --pretty=format:'%an'",
-                    returnStdout: true
-                ).trim()
-                if (committerEmail.contains('noreply')) {
-                    committerEmail = 'devops@yourorg.com'
-                }
-                mail(
-                    to: committerEmail,
-                    subject: "✅ Build SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                    body: """
-Hi ${committerName},
-Livestock Registry build and deployment succeeded!
-Job:    ${env.JOB_NAME}
-Branch: ${env.GIT_BRANCH}
-Build:  #${env.BUILD_NUMBER}
-URL:    ${env.BUILD_URL}
-Regards,
-Jenkins
-                    """
-                )
-            }
-        }
-        failure {
-            script {
-                def committerEmail = sh(
-                    script: "git log -1 --pretty=format:'%ae'",
-                    returnStdout: true
-                ).trim()
-                def committerName = sh(
-                    script: "git log -1 --pretty=format:'%an'",
-                    returnStdout: true
-                ).trim()
-                if (committerEmail.contains('noreply')) {
-                    committerEmail = 'simretyibeltal@gmail.com, Pavan.ns@gmail.com'
-                }
-                mail(
-                    to: committerEmail,
-                    subject: "❌ Build FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
-                    body: """
-Hi ${committerName},
-Livestock Registry build or deployment failed.
-Job:    ${env.JOB_NAME}
-Branch: ${env.GIT_BRANCH}
-Build:  #${env.BUILD_NUMBER}
-URL:    ${env.BUILD_URL}
-Regards,
-Jenkins
-                    """
-                )
-            }
+        always {
+            sh 'docker image prune -f || true'
+            sh "docker logout ${ECR_REGISTRY} || true"
         }
     }
 }
