@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -13,6 +14,9 @@ import tarfile
 import urllib.request
 
 PROFILE = Path(__file__).with_name("oan-chart.json")
+# The pin of the chart release a build has just produced from its own images (ci/deploy/release_images.py). It has
+# the same shape and goes through the same checks; only the chart it names is newer than the committed pin.
+CANDIDATE_ENV = "OAN_CHART_PIN_FILE"
 CENTRAL_CACHE = Path(__file__).resolve().parents[2] / ".central-charts"
 
 
@@ -34,7 +38,39 @@ def yaml_document(data):
         raise ValueError('Invalid packaged YAML metadata') from None
 
 def profiles():
-    return json.loads(PROFILE.read_text(encoding="utf-8"))
+    override = os.environ.get(CANDIDATE_ENV)
+    return json.loads((Path(override) if override else PROFILE).read_text(encoding="utf-8"))
+
+
+def yaml_module():
+    yaml_document(b"{}")                     # makes the vendored PyYAML importable on the stock Python
+    import yaml
+    return yaml
+
+
+# The image sections the oan-helm chart carries for this registry (release_images.py writes their tags).
+IMAGE_SECTIONS = ("staffApi", "partnerApi", "celeryWorker", "celeryBeat", "dbSeed", "staffUi", "sanity")
+
+
+def strip_images(path):
+    """Remove every image setting from a saved values file, so the chart's own images (tag and digest) apply.
+
+    `helm get values --all` records the image the old release ran; passed back with -f it would override the images of
+    the new chart. Everything else in the file (hostnames, wiring) is kept.
+    """
+    yaml = yaml_module()
+    document = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    removed = 0
+    registry = document.get("registry")
+    if isinstance(registry, dict):
+        for section in IMAGE_SECTIONS:
+            if isinstance(registry.get(section), dict) and registry[section].pop("image", None) is not None:
+                removed += 1
+    dashboard = document.get("dashboardApi")
+    if isinstance(dashboard, dict) and dashboard.pop("image", None) is not None:
+        removed += 1
+    Path(path).write_text(yaml.safe_dump(document, default_flow_style=False), encoding="utf-8")
+    return removed
 
 def validate_pin(pin):
     if not re.fullmatch(r"https://raw\.githubusercontent\.com/Centre-for-Open-Societal-Systems/oan-helm/[0-9a-f]{40}/repository/",pin["repository"]):
@@ -146,7 +182,7 @@ def fetch_values(pin, destination):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action",choices=("url","verify","fetch","values","prefetch","require-deployable","is-deployable","platform","version"))
+    parser.add_argument("action",choices=("url","verify","fetch","values","prefetch","require-deployable","is-deployable","platform","version","strip-images"))
     parser.add_argument("role",choices=("registry","dashboard"))
     parser.add_argument("argument",nargs="?")
     args = parser.parse_args()
@@ -163,6 +199,7 @@ def main():
     elif args.action=="is-deployable": print("true" if is_deployable(pin,args.argument or "dev") else "false")
     elif args.action=="platform": print(pin["platformVersion"])
     elif args.action=="version": print(pin["version"])
+    elif args.action=="strip-images": print("removed image settings from %d sections" % strip_images(args.argument))
 
 if __name__=="__main__":
     try:

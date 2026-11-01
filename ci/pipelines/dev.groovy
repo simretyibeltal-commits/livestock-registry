@@ -206,6 +206,23 @@ pipeline {
                                 docker push ${api}
                             """
                         }
+
+                        // The ECR digest of every image the oan-helm chart carries: the next stage writes
+                        // <commit>@<digest> into the chart, and the deploy checks the manifests against these.
+                        def digested = ['staff-api', 'partner-api', 'celery', 'db-seed', 'sanity-tests', 'staff-ui']
+                        if (env.DASHBOARD_API_SHA) { digested << 'dashboard-api' }
+                        sh """
+                            set -eu
+                            mkdir -p .build
+                            : > .build/image-digests.tsv
+                            for c in ${digested.join(' ')}; do
+                                d=\$(aws ecr describe-images --region ${AWS_REGION} --repository-name ${ECR_PATH}/\$c \
+                                      --image-ids imageTag=${env.IMAGE_TAG} --query 'imageDetails[0].imageDigest' --output text)
+                                case "\$d" in sha256:*) ;; *) echo "no ECR digest for \$c:${env.IMAGE_TAG}" >&2; exit 1 ;; esac
+                                printf '%s\\t%s\\n' "\$c" "\$d" >> .build/image-digests.tsv
+                            done
+                        """
+                        stash name: 'image-digests', includes: '.build/image-digests.tsv'
                     }
                 }
             }
@@ -219,6 +236,47 @@ pipeline {
             steps {
                 sh 'docker run --rm --user "$(id -u):$(id -g)" --entrypoint python -v "$PWD:/work" -w /work openg2p/openg2p-registry-staff-api:1.2.2-rc.614 ci/deploy/oan_chart.py prefetch registry'
                 stash name: 'deploy', includes: 'ci/**,scripts/**,.central-charts/**'
+            }
+        }
+
+        stage('Release images to oan-helm') {
+            // Turns this build into a Helm release: the image tags and digests go into the oan-helm chart through a
+            // pull request that is merged when its checks pass, oan-helm's release workflow publishes the next chart
+            // version, and the pin of that release (.build/oan-chart-candidate.json) is what the deploy uses. If
+            // anything here fails the stage is UNSTABLE and there is no candidate: the deploy stage then leaves the
+            // cluster on the last working release (no upgrade, no image overrides). One release per commit merged to
+            // develop: a re-run of a commit already in oan-helm, and a commit that only changes the pin, release
+            // nothing (the reason is written to .build/release-note.txt).
+            when {
+                beforeAgent true
+                branch 'develop'
+                expression { !((params.NEW_DEV_DELIVERY_ACTION ?: 'deploy') in ['fresh-install', 'connector-plan', 'connector-upgrade']) }
+            }
+            agent { label 'vpn-agent2' }
+            options { timeout(time: 75, unit: 'MINUTES') }
+            steps {
+                checkout scm
+                sh 'mkdir -p .build && rm -f .build/oan-chart-candidate.json .build/release-note.txt .build/image-digests.tsv'
+                unstash 'image-digests'
+                script {
+                    def subject = sh(returnStdout: true, script: 'git log -1 --pretty=%s').trim()
+                    catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                        withCredentials([usernamePassword(credentialsId: "${PIN_PR_CRED_ID}", usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
+                            withEnv(["COMMIT_SUBJECT=${subject}", "SOURCE_COMMIT=${env.GIT_COMMIT}", "ECR_PATH=${ECR_PATH}"]) {
+                                sh '''
+                                    set -eu
+                                    python3 ci/deploy/release_images.py
+                                    if [ -f .build/oan-chart-candidate.json ]; then
+                                        # Verify the release and cache it, so the deploy node needs no GitHub access.
+                                        OAN_CHART_PIN_FILE=.build/oan-chart-candidate.json python3 ci/deploy/oan_chart.py prefetch registry \
+                                          || { rm -f .build/oan-chart-candidate.json; exit 1; }
+                                    fi
+                                '''
+                            }
+                        }
+                    }
+                    stash name: 'candidate', includes: '.build/oan-chart-candidate.json,.build/release-note.txt,.build/image-digests.tsv,.central-charts/**', allowEmpty: true
+                }
             }
         }
 
@@ -289,16 +347,37 @@ EOF
             agent { label 'vpn-agent2' }
             options { timeout(time: 60, unit: 'MINUTES') }
             steps {
-                sh 'rm -rf ci scripts .central-charts'
+                sh 'rm -rf ci scripts .central-charts && mkdir -p .build && rm -f .build/oan-chart-candidate.json .build/release-note.txt .build/image-digests.tsv'
                 unstash 'deploy'
+                script {
+                    // The chart release made from this build's images (stage "Release images to oan-helm"). Without one
+                    // (the stage failed, or this commit was already released, or it only moves the pin) nothing is
+                    // upgraded: images reach New Dev only through a chart release, so the cluster stays on the last
+                    // working release. A failed release stage leaves the build UNSTABLE; a deliberate skip does not.
+                    try { unstash 'candidate' } catch (ignored) { echo 'No candidate was handed over by the release stage.' }
+                    env.NEWDEV_SKIP_DEPLOY = (params.NEW_DEV_DELIVERY_ACTION != 'fresh-install' && !fileExists('.build/oan-chart-candidate.json')) ? 'yes' : 'no'
+                    if (env.NEWDEV_SKIP_DEPLOY == 'yes') {
+                        if (fileExists('.build/release-note.txt')) {
+                            echo readFile('.build/release-note.txt').trim()
+                        } else {
+                            unstable('No chart release was made for this build (see the stage "Release images to oan-helm"). Nothing was deployed: New Dev stays on the last working release.')
+                        }
+                    }
+                }
                 // A failed deploy is rolled back by ci/deploy/deploy-livestock-dev.sh and then fails
                 // the build: no catchError, so it is never reported as a pass.
                 withCredentials([file(credentialsId: "${DEV_KUBECONFIG_CRED_ID}", variable: 'KUBECONFIG')]) {
                     script {
+                      if (env.NEWDEV_SKIP_DEPLOY == 'yes') {
+                        echo 'Skipping the upgrade: no chart release for this build.'
+                      } else {
                         def deployEnv = [
                             "DEV_NAMESPACE=${DEV_NAMESPACE}", "ECR_REGISTRY=${env.ECR_REGISTRY}", "ECR_PATH=${ECR_PATH}",
                             "IMAGE_TAG=${env.IMAGE_TAG}", "DASHBOARD_UI_ECR=${DASHBOARD_UI_ECR}", "DASHBOARD_UI_SHA=${env.DASHBOARD_UI_SHA}",
                         ]
+                        if (fileExists('.build/oan-chart-candidate.json') && params.NEW_DEV_DELIVERY_ACTION != 'fresh-install') {
+                            deployEnv += ["OAN_CHART_PIN_FILE=.build/oan-chart-candidate.json", "IMAGE_DIGESTS_FILE=.build/image-digests.tsv"]
+                        }
                         withEnv(deployEnv) {
                             if (params.NEW_DEV_DELIVERY_ACTION == 'fresh-install') {
                                 // The database archive goes to the New Dev box over the existing backup key.
@@ -309,6 +388,7 @@ EOF
                                 sh 'bash ci/deploy/deploy-livestock-dev.sh'
                             }
                         }
+                      }
                     }
                 }
             }
@@ -362,9 +442,21 @@ EOF
             options { timeout(time: 10, unit: 'MINUTES') }
             steps {
                 checkout scm
-                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                    withCredentials([usernamePassword(credentialsId: "${PIN_PR_CRED_ID}", usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
-                        sh 'python3 ci/deploy/propose_pin_pr.py'
+                sh 'mkdir -p .build && rm -f .build/oan-chart-candidate.json .build/image-digests.tsv'
+                script {
+                    // With the chart release this build made and deployed, the pull request records exactly that pin.
+                    try { unstash 'candidate' } catch (ignored) { echo 'No candidate was handed over by the release stage.' }
+                    if (!fileExists('.build/oan-chart-candidate.json')) {
+                        echo 'This build deployed no chart release: the pin is not changed.'
+                        return
+                    }
+                    def withCandidate = ['OAN_CHART_PIN_FILE=.build/oan-chart-candidate.json']
+                    catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        withCredentials([usernamePassword(credentialsId: "${PIN_PR_CRED_ID}", usernameVariable: 'GH_USER', passwordVariable: 'GH_TOKEN')]) {
+                            withEnv(withCandidate) {
+                                sh 'python3 ci/deploy/propose_pin_pr.py'
+                            }
+                        }
                     }
                 }
             }

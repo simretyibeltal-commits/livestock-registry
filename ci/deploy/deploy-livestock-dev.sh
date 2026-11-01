@@ -17,6 +17,12 @@
 #      `deployed` before this run (ci/deploy/release-rollback.sh), then fail. A first
 #      install has nothing to go back to. Hooks' database changes are not undone.
 #
+# Chart release mode (OAN_CHART_PIN_FILE set): the develop build has put its own images into the oan-helm chart and
+# waited for the release (ci/deploy/release_images.py). The pin of that release replaces the committed pin for this
+# run, the saved release values lose their image settings so the chart's tags and digests apply, no image --set flags
+# are passed, and the rendered manifests must name exactly the images in IMAGE_DIGESTS_FILE before anything changes.
+# Without it (the release step was skipped or failed) the committed pin is deployed with this build's image tags.
+#
 # Env (Jenkins supplies them):
 #   KUBECONFIG        livestock-dev-kubeconfig
 #   DEV_NAMESPACE     default livestock
@@ -26,6 +32,8 @@
 #   IMAGE_TAG         this build's image tag
 #   DASHBOARD_UI_ECR, DASHBOARD_UI_SHA  dashboard UI image (ci/dashboard/deploy-ui.sh)
 #   BUILD_NUMBER      names the archived rendered manifests
+#   OAN_CHART_PIN_FILE  optional: pin file of the chart release made for this build
+#   IMAGE_DIGESTS_FILE  with it: component<TAB>sha256:digest of this build's images
 set -euo pipefail
 set +x
 
@@ -57,6 +65,13 @@ on_exit() {
   exit "$rc"
 }
 
+CHART_RELEASE=0
+if [ -n "${OAN_CHART_PIN_FILE:-}" ]; then
+  CHART_RELEASE=1
+  : "${IMAGE_DIGESTS_FILE:?chart release mode needs IMAGE_DIGESTS_FILE}"
+  export OAN_CHART_PIN_FILE
+  echo "chart release mode: deploying $(python3 ci/deploy/oan_chart.py version registry) from ${OAN_CHART_PIN_FILE}"
+fi
 python3 ci/deploy/oan_chart.py require-deployable registry dev
 WORK=$(mktemp -d)
 trap on_exit EXIT
@@ -70,34 +85,49 @@ if ! helm get values "$HELM_RELEASE" -n "$DEV_NAMESPACE" --all -o yaml > "$WORK/
   echo "No release $HELM_RELEASE in $DEV_NAMESPACE yet: installing on the chart's public values."
   : > "$WORK/current-values.yaml"
 fi
+if [ "$CHART_RELEASE" = 1 ]; then
+  python3 ci/deploy/oan_chart.py strip-images registry "$WORK/current-values.yaml"
+fi
 # A release left half-way through an upgrade or rollback cannot be upgraded or rolled back: stop before changing anything.
 case "$(latest_status "$HELM_RELEASE" "$DEV_NAMESPACE")" in
   pending-*) echo "FATAL: $HELM_RELEASE in $DEV_NAMESPACE is in a pending Helm operation; resolve it (helm history) before deploying." >&2; exit 1 ;;
 esac
 # The revision to go back to if this run fails: the last one Helm recorded as `deployed`.
 PREV="$(last_deployed_revision "$HELM_RELEASE" "$DEV_NAMESPACE")"
-if [ -n "$PREV" ]; then echo "rollback target: revision ${PREV}"; else echo "rollback target: none (no deployed revision found)"; fi
+if [ -n "$PREV" ]; then
+  echo "rollback target: revision ${PREV} ($(revision_chart "$HELM_RELEASE" "$DEV_NAMESPACE" "$PREV"), the last working release)"
+else
+  echo "rollback target: none (no deployed revision found)"
+fi
 
-IMAGE_SET_FLAGS=(
-  --set "registry.staffApi.image.repository=${ECR_REGISTRY}/${ECR_PATH}/staff-api"
-  --set-string "registry.staffApi.image.tag=${IMAGE_TAG}"
-  --set "registry.partnerApi.image.repository=${ECR_REGISTRY}/${ECR_PATH}/partner-api"
-  --set-string "registry.partnerApi.image.tag=${IMAGE_TAG}"
-  --set "registry.celeryWorker.image.repository=${ECR_REGISTRY}/${ECR_PATH}/celery"
-  --set-string "registry.celeryWorker.image.tag=${IMAGE_TAG}"
-  --set "registry.celeryBeat.image.repository=${ECR_REGISTRY}/${ECR_PATH}/celery"
-  --set-string "registry.celeryBeat.image.tag=${IMAGE_TAG}"
-  --set "registry.dbSeed.image.repository=${ECR_REGISTRY}/${ECR_PATH}/db-seed"
-  --set-string "registry.dbSeed.image.tag=${IMAGE_TAG}"
-  --set "registry.staffUi.image.repository=${ECR_REGISTRY}/${ECR_PATH}/staff-ui"
-  --set-string "registry.staffUi.image.tag=${IMAGE_TAG}"
-  --set "registry.sanity.image.repository=${ECR_REGISTRY}/${ECR_PATH}/sanity-tests"
-  --set-string "registry.sanity.image.tag=${IMAGE_TAG}"
-  --set dashboardApi.enabled=true
-  --set "dashboardApi.image.repository=${ECR_REGISTRY}/${ECR_PATH}/dashboard-api"
-  --set-string "dashboardApi.image.tag=${IMAGE_TAG}"
-  --set reporting.views.enabled=true
-)
+if [ "$CHART_RELEASE" = 1 ]; then
+  # The chart carries the images (tag@digest); only the switches are set here.
+  IMAGE_SET_FLAGS=(
+    --set dashboardApi.enabled=true
+    --set reporting.views.enabled=true
+  )
+else
+  IMAGE_SET_FLAGS=(
+    --set "registry.staffApi.image.repository=${ECR_REGISTRY}/${ECR_PATH}/staff-api"
+    --set-string "registry.staffApi.image.tag=${IMAGE_TAG}"
+    --set "registry.partnerApi.image.repository=${ECR_REGISTRY}/${ECR_PATH}/partner-api"
+    --set-string "registry.partnerApi.image.tag=${IMAGE_TAG}"
+    --set "registry.celeryWorker.image.repository=${ECR_REGISTRY}/${ECR_PATH}/celery"
+    --set-string "registry.celeryWorker.image.tag=${IMAGE_TAG}"
+    --set "registry.celeryBeat.image.repository=${ECR_REGISTRY}/${ECR_PATH}/celery"
+    --set-string "registry.celeryBeat.image.tag=${IMAGE_TAG}"
+    --set "registry.dbSeed.image.repository=${ECR_REGISTRY}/${ECR_PATH}/db-seed"
+    --set-string "registry.dbSeed.image.tag=${IMAGE_TAG}"
+    --set "registry.staffUi.image.repository=${ECR_REGISTRY}/${ECR_PATH}/staff-ui"
+    --set-string "registry.staffUi.image.tag=${IMAGE_TAG}"
+    --set "registry.sanity.image.repository=${ECR_REGISTRY}/${ECR_PATH}/sanity-tests"
+    --set-string "registry.sanity.image.tag=${IMAGE_TAG}"
+    --set dashboardApi.enabled=true
+    --set "dashboardApi.image.repository=${ECR_REGISTRY}/${ECR_PATH}/dashboard-api"
+    --set-string "dashboardApi.image.tag=${IMAGE_TAG}"
+    --set reporting.views.enabled=true
+  )
+fi
 
 helm template "$HELM_RELEASE" "$CHART" -n "$DEV_NAMESPACE" \
   -f "$WORK/current-values.yaml" -f "$CENTRAL_VALUES" "${IMAGE_SET_FLAGS[@]}" \
@@ -106,6 +136,22 @@ if grep -q 'openg2p\.org' "newdev-rendered-${BUILD_NUMBER}.yaml"; then
   echo "FATAL: rendered manifests still reference the placeholder domain openg2p.org:" >&2
   grep -n 'openg2p\.org' "newdev-rendered-${BUILD_NUMBER}.yaml" | head -20 >&2
   exit 1
+fi
+if [ "$CHART_RELEASE" = 1 ]; then
+  # Fail before the release changes if the chart does not run exactly this build's images.
+  python3 - "$IMAGE_DIGESTS_FILE" "newdev-rendered-${BUILD_NUMBER}.yaml" "${ECR_REGISTRY}/${ECR_PATH}" "$IMAGE_TAG" <<'PY'
+import sys
+digests = dict(line.split("\t") for line in open(sys.argv[1]).read().split("\n") if line.strip())
+rendered, base, tag = open(sys.argv[2]).read(), sys.argv[3], sys.argv[4]
+wanted = ["%s/%s:%s@%s" % (base, c, tag, digests[c].strip()) for c in ("staff-api", "partner-api", "celery", "db-seed", "staff-ui", "sanity-tests")]
+wanted.append("%s/dashboard-api@%s" % (base, digests["dashboard-api"].strip()))
+missing = [w for w in wanted if w not in rendered]
+if missing:
+    print("FATAL: the chart release does not run this build's images; not in the rendered manifests:")
+    print("\n".join("  " + m for m in missing))
+    sys.exit(1)
+print("chart release carries exactly this build's %d images" % len(wanted))
+PY
 fi
 # Convert once and check each guard's exit status before Helm changes the
 # release. Neither guard prints rendered Secrets or private key material.

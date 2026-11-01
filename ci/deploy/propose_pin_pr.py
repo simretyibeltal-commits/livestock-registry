@@ -3,6 +3,11 @@
 Run by the last stage of the develop Jenkins build, after the deploy succeeded. It never deploys and
 never changes `develop`: it pushes a branch and opens a pull request, and a person merges it.
 
+Two modes. When the build made its own chart release (OAN_CHART_PIN_FILE, ci/deploy/release_images.py) and deployed it,
+the pull request records exactly that chart as the pin, on one rolling branch (bot/oan-chart-pin) whose open pull request
+is updated by each build, so builds do not pile up pull requests. Otherwise the pin is compared with the head of oan-helm
+main (the original behaviour). A commit that only changes the pin never proposes anything: it is that pull request.
+
   1. ci/deploy/bump_pin.py decides: a newer chart, or changed public values, on oan-helm main (never a
      downgrade; a changed archive for the same version is an error). Nothing to do -> exit 0.
   2. Otherwise it writes the new pin on a new branch, runs the pin tests and a verified prefetch of the
@@ -83,15 +88,22 @@ def auth(token):
     return ["-c", "http.extraheader=AUTHORIZATION: basic " + basic]
 
 
-def pr_body(reason, lines):
+def pr_body(reason, lines, candidate=False, build_url=""):
+    if candidate:
+        origin = ["This is the chart release the develop build made from its own images (%s) and deployed to New Dev "
+                  "successfully; merging records it as the pin, so a fresh checkout and any manual deploy use the last "
+                  "release that worked." % (build_url or "Jenkins build"),
+                  "", "One rolling pull request: each build that deploys a newer release updates this one."]
+    else:
+        origin = ["Pinned to the head of oan-helm `main` at proposal time; the pin names that exact commit and is verified "
+                  "by SHA-256."]
     return "\n".join([
         "Moves the pinned oan-helm Livestock chart and public values for the New Dev deploy (opened by the develop Jenkins build).",
         "",
-        "```", reason] + lines + ["```", "",
-        "Pinned to the head of oan-helm `main` at proposal time; the pin names that exact commit and is verified by SHA-256.",
-        "",
+        "```", reason] + lines + ["```", ""] + origin + ["",
         "**Merging this deploys to New Dev.** The develop build runs `ci/deploy/deploy-livestock-dev.sh`: render, route and "
-        "Farmer-reference guards, `helm upgrade --install`, rollout checks, and a rollback to the last deployed revision on failure.",
+        "Farmer-reference guards, `helm upgrade --install`, rollout checks, and a rollback to the last deployed revision on failure. "
+        "A commit that only changes the pin does not release images again.",
         "",
         "Before merging:",
         "- Read the oan-helm CHANGELOG entry and release notes for the new chart or values.",
@@ -103,10 +115,17 @@ def pr_body(reason, lines):
         ""])
 
 
-def propose(token, bump=None, runner=run, call=api, root=ROOT):
+def propose(token, bump=None, runner=run, call=api, root=ROOT, candidate=None):
     bump = bump or load_bump()
     old = json.loads(bump.PROFILE.read_text(encoding="utf-8"))
-    new, reason = bump.proposal(old)
+    if candidate is None:
+        found = os.environ.get("OAN_CHART_PIN_FILE", "")
+        candidate = found if found and Path(found).exists() else ""
+    rolling = bool(candidate)
+    if rolling:
+        new, reason = bump.from_candidate(old, candidate)
+    else:
+        new, reason = bump.proposal(old)
     print(reason)
     if new is None:
         return 0
@@ -122,37 +141,48 @@ def propose(token, bump=None, runner=run, call=api, root=ROOT):
         return 3
 
     pin = new[bump.ROLE]
-    branch = "bot/oan-chart-pin-%s-%s" % (pin["version"], pin["values"]["sha256"][:8])
+    branch = "bot/oan-chart-pin" if rolling else "bot/oan-chart-pin-%s-%s" % (pin["version"], pin["values"]["sha256"][:8])
     slug = slug_of(runner(["git", "remote", "get-url", "origin"], "git remote get-url", root))
-    status, pulls = call("GET", "/repos/%s/pulls?state=all&head=%s:%s" % (slug, slug.split("/")[0], branch), token)
+    state = "open" if rolling else "all"
+    status, pulls = call("GET", "/repos/%s/pulls?state=%s&head=%s:%s" % (slug, state, slug.split("/")[0], branch), token)
     if status != 200:
         print("GitHub refused to list pull requests (HTTP %s): the credential needs Contents and Pull requests "
               "write on %s." % (status, slug))
         return 4
-    if pulls:
+    if pulls and not rolling:
         print("Already proposed: %s (%s)" % (pulls[0].get("html_url"), pulls[0].get("state")))
         return 0
 
     title = "Pin OAN chart: " + reason
-    body = pr_body(reason, lines)
+    body = pr_body(reason, lines, rolling, os.environ.get("BUILD_URL", ""))
     exists = runner(["git"] + auth(token) + ["ls-remote", "--heads", "origin", branch], "git ls-remote", root).strip()
-    if not exists:
+    if rolling or not exists:
         original = runner(["git", "rev-parse", "HEAD"], "git rev-parse", root).strip()
         try:
             changed = bump.apply_pin(old, new, root)
             env = dict(os.environ, PYTHONPATH=str(HERE / "vendor"))      # the vendored PyYAML for the pin tests
+            env.pop("OAN_CHART_PIN_FILE", None)                           # these checks are about the pin being written
             runner(["python3", "-m", "unittest", "discover", "-s", "test", "-p", "test_oan_chart.py"],
                    "the pin tests", root, env)
             runner(["python3", "ci/deploy/oan_chart.py", "prefetch", "registry"], "verified prefetch of the new pin", root, env)
             runner(["git", "checkout", "-q", "-b", branch], "git checkout -b", root)
             runner(["git", "add", "--"] + changed, "git add", root)
             runner(["git"] + AUTHOR + ["commit", "-q", "-m", title], "git commit", root)
-            runner(["git"] + auth(token) + ["push", "-q", "origin", "HEAD:refs/heads/" + branch], "git push", root)
+            push = ["push", "-q"] + (["--force"] if rolling else []) + ["origin", "HEAD:refs/heads/" + branch]
+            runner(["git"] + auth(token) + push, "git push", root)
             print("pushed " + branch)
         finally:
             # leave the workspace as the build found it
             runner(["git", "checkout", "-q", "-f", original], "git checkout", root, check=False)
             runner(["git", "branch", "-D", branch], "git branch -D", root, check=False)
+    if pulls and rolling:
+        status, updated = call("PATCH", "/repos/%s/pulls/%d" % (slug, pulls[0]["number"]), token, {"title": title, "body": body})
+        if status != 200:
+            print("GitHub refused to update the pull request (HTTP %s): %s. The branch %s is pushed." % (
+                status, (updated or {}).get("message"), branch))
+            return 4
+        print("updated " + pulls[0].get("html_url", "(no url)"))
+        return 0
     status, created = call("POST", "/repos/%s/pulls" % slug, token,
                            {"title": title, "head": branch, "base": BASE, "body": body})
     if status not in (200, 201):
@@ -163,8 +193,18 @@ def propose(token, bump=None, runner=run, call=api, root=ROOT):
     return 0
 
 
+def pin_only_commit():
+    spec = importlib.util.spec_from_file_location("release_images", HERE / "release_images.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.pin_only_commit(ROOT)
+
+
 def main():
     try:
+        if pin_only_commit():
+            print("This commit only changes the chart pin: nothing to propose (it is the pin pull request itself).")
+            return 0
         return propose(os.environ.get("GH_TOKEN", ""))
     except (ValueError, KeyError, OSError) as error:
         print("FAIL: %s" % error)

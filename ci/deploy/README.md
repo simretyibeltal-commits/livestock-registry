@@ -33,34 +33,61 @@ A corrupt cached archive fails closed and does not trigger a network fallback.
 Manual runs can prefetch on a connected machine and carry that directory with
 the same immutable profile. Cached archives are not editable Helm sources.
 
-## Deploy, rollback and pin updates (New Dev)
+## Images, chart release, deploy, rollback and pin (New Dev)
 
-Every `develop` build builds and pushes the images and then runs
-`ci/deploy/deploy-livestock-dev.sh` (no parameter to tick; the `NEW_DEV_DELIVERY_ACTION`
-choice only carries the deliberate maintenance runs `fresh-install`, `connector-plan`
-and `connector-upgrade`). The script records the last `deployed` Helm revision, upgrades
-the release with the pinned chart and public values and this build's image tags, waits
-for the rollouts and runs the guards. If anything fails from the upgrade onwards it saves
-`deploy-failure-<build>.txt` (pods, events, hook and application logs; archived by the
-build), runs `helm rollback` to that revision (`ci/deploy/release-rollback.sh`) and fails
-the build. A first install has nothing to go back to. A rollback restores the chart and
-values; it does not undo database changes made by hooks. There is no `--atomic`, so the
-evidence survives. A release left in a `pending-*` Helm state is refused before any change.
+Every `develop` build runs these stages (no parameter to tick; `NEW_DEV_DELIVERY_ACTION`
+only carries the deliberate maintenance runs `fresh-install`, `connector-plan`,
+`connector-upgrade`):
 
-The last stage, "Propose chart pin update", compares the pin with the head of oan-helm
-`main` (`python3 ci/deploy/propose_pin_pr.py`). If the Livestock chart is newer, or its
-public values changed, it opens a pull request to `develop` that rewrites only the
-`registry` pin in `oan-chart.json`: the oan-helm commit, version, archive SHA-256,
-public-values SHA-256 and platform version. It never deploys and never changes `develop`;
-a person reviews and merges it, and the next `develop` build deploys the new pin. The stage
-needs a GitHub credential (`oan-ci-app`) with Contents and Pull requests write; without it
-the stage is UNSTABLE and the build still passes. It refuses a downgrade and a changed
-archive for the same version, and does not propose a chart that needs another platform
-version: the Dockerfiles and the pipeline have to move with it (run
-`scripts/bump-rp-version.sh`, move `RP_VERSION` and the `openg2p/openg2p-registry-*` tags in
-`ci/pipelines/dev.groovy` and `ci/refactor`, then
-`python3 ci/deploy/bump_pin.py <oan-helm commit> --write`). The `dashboard` pin is separate
-and is not touched.
+1. **Build & Push Images** pushes the images to ECR (`<commit12>` tags) and records each
+   ECR digest in `.build/image-digests.tsv`.
+2. **Release images to oan-helm** (`ci/deploy/release_images.py`) writes the build's
+   `<commit12>@sha256:<digest>` into `charts/openg2p-livestock-registry/values.yaml` of
+   oan-helm (the seven registry image tags, and the dashboard-api tag and digest; only those
+   lines change) on `bot/livestock-images-<commit12>`, opens a pull request, waits for its
+   checks and merges it. oan-helm's release workflow then publishes the next chart version;
+   the stage waits until the archive at the head of `main` carries exactly these images and
+   writes that release's pin to `.build/oan-chart-candidate.json`. It needs `oan-ci-app`
+   installed on oan-helm with Contents and Pull requests write, Checks read, and permission
+   to merge there. If anything fails (no credential, a check fails, the merge needs a person,
+   no release in 30 minutes) the stage is UNSTABLE and no candidate is written. Without a
+   candidate the deploy stage upgrades nothing: images reach New Dev only through a chart
+   release, so New Dev stays on the last working release and the build says so (UNSTABLE for a
+   failed release stage). One chart release per commit merged to develop: a re-run, Replay or
+   rebuild of a commit whose `<commit12>` tag is already in oan-helm `main` does nothing here
+   (no pull request, no chart version, no CHANGELOG entry, stage SUCCESS) and nothing is
+   deployed. A commit that only changes `ci/deploy/oan-chart.json` is not released again
+   either, with the same result. The reason for a deliberate skip is written to
+   `.build/release-note.txt` and printed by the deploy stage. If a release failed after its
+   oan-helm pull request merged, re-running the same commit does not repeat it; the next new
+   commit releases. Replaying an old commit after a newer one was released is not guarded: do
+   not Replay old develop builds.
+3. **Deploy to Development** (`ci/deploy/deploy-livestock-dev.sh`). With a candidate
+   (`OAN_CHART_PIN_FILE`, chart release mode) it deploys that release, verified by SHA-256;
+   the saved release values lose their image settings so the chart's tags and digests apply;
+   no image `--set` flags are passed; and before anything changes the rendered manifests
+   must contain exactly the images of `IMAGE_DIGESTS_FILE`. The script records the last
+   `deployed` Helm revision (printed with its chart, e.g. `rollback target: revision 49
+   (openg2p-livestock-registry-1.0.0-dev.19, the last working release)`), upgrades, waits for
+   the rollouts and runs the guards. If anything fails from the upgrade onwards it saves
+   `deploy-failure-<build>.txt` (archived), runs `helm rollback` to that revision
+   (`ci/deploy/release-rollback.sh`) and fails the build. A first install has nothing to go
+   back to. A rollback restores the chart and values; it does not undo database changes made
+   by hooks. No `--atomic`, so the evidence survives; a `pending-*` release is refused.
+4. **Propose chart pin update** (`ci/deploy/propose_pin_pr.py`), after a successful deploy.
+   With the build's candidate it opens, or updates, one rolling pull request
+   `bot/oan-chart-pin` to `develop` that records exactly the release that was deployed in
+   `oan-chart.json` (version, SHA-256, oan-helm commit, public values, platform). A person
+   merges it; merging it starts a build that releases nothing new (pin-only commit). Without
+   a candidate it compares the pin with the head of oan-helm `main` as before. It refuses a
+   downgrade and a changed archive for the same version, and does not propose a chart that
+   needs another platform version (the Dockerfiles and the pipeline must move with it: run
+   `scripts/bump-rp-version.sh`, move `RP_VERSION` and the `openg2p/openg2p-registry-*` tags in
+   `ci/pipelines/dev.groovy` and `ci/refactor`, then `python3 ci/deploy/bump_pin.py <commit> --write`).
+   The `dashboard` pin is separate and is not touched.
+
+`DRY_RUN=1 python3 ci/deploy/release_images.py` (with `IMAGE_TAG`, `ECR_REGISTRY` and
+`.build/image-digests.tsv`) prints the tags it would write and changes nothing.
 
 Checks without a cluster or network:
 `python3 -m unittest discover -s test -p test_deploy_ci.py -v`.

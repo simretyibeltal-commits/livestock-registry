@@ -2,6 +2,7 @@
 # Helm release rollback helpers, sourced by ci/deploy/deploy-livestock-dev.sh.
 #
 #   last_deployed_revision <release> <namespace>   the last revision Helm recorded as `deployed`, or nothing
+#   revision_chart         <release> <namespace> <revision>   the chart of that revision (name-version), or nothing
 #   latest_status          <release> <namespace>   the status of the newest revision, or nothing
 #   rollback_release <release> <namespace> <revision> <why> <report-file>
 #                                                  save diagnostics, then `helm rollback` to <revision>
@@ -21,6 +22,18 @@ except ValueError:
 done = [r["revision"] for r in rows if r.get("status") == "deployed"]
 print(done[-1] if done else "")
 ' || true
+}
+
+revision_chart() {
+  helm history "$1" -n "$2" -o json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+except ValueError:
+    rows = []
+want = int(sys.argv[1])
+print(next((r.get("chart", "") for r in rows if r.get("revision") == want), ""))
+' "$3" || true
 }
 
 latest_status() {

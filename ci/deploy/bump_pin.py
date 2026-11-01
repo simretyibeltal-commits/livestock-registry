@@ -144,6 +144,23 @@ def proposal(old, fetch=get, head=head_commit):
     return new, "newer chart %s released (pinned %s)" % (b["version"], a["version"])
 
 
+def from_candidate(old, path):
+    """(new profiles, reason) for the chart release a develop build made from its own images, as the pin file the
+    deploy used (ci/deploy/release_images.py). Same refusals as `proposal`; nothing to do when it is the pinned chart."""
+    new = json.loads(Path(path).read_text(encoding="utf-8"))
+    a, b = old[ROLE], new[ROLE]
+    if version_key(b["version"]) < version_key(a["version"]):
+        raise ValueError("the deployed chart %s is older than the pin %s: refusing to downgrade" % (b["version"], a["version"]))
+    if b["version"] == a["version"] and b["sha256"] != a["sha256"]:
+        raise ValueError("the archive for %s changed (%s -> %s): published archives are immutable, so stop and ask oan-helm"
+                         % (a["version"], a["sha256"][:12], b["sha256"]))
+    if b["version"] == a["version"] and b["values"]["sha256"] == a["values"]["sha256"]:
+        return None, "up to date: the chart deployed by this build (%s) is the pinned chart" % a["version"]
+    if b["version"] == a["version"]:
+        return new, "public values changed on oan-helm main (chart stays %s)" % a["version"]
+    return new, "chart %s, released from this build's images and deployed, replaces the pinned %s" % (b["version"], a["version"])
+
+
 def update_companions(old, new, root=None):
     """Nothing besides the pin is rewritten for the Livestock profile; the platform version is moved by hand."""
     return []
