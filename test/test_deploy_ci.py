@@ -91,6 +91,11 @@ class DeployRollbackTests(unittest.TestCase):
         (self.repo / "ci/check-new-dev-routes.py").write_text(ROUTES_STUB)
         (self.repo / "ci/refactor/deployment_guard.py").write_text(GUARD_STUB)
         (self.repo / "ci/dashboard/deploy-ui.sh").write_text(DASHBOARD_STUB)
+        # What 'Package chart' leaves: the registry chart, and the dashboard chart with its values in dashboard/.
+        self.built = base / "built-chart"
+        (self.built / "dashboard").mkdir(parents=True)
+        (self.built / "openg2p-livestock-registry-1.0.0-develop.9.tgz").write_text("")
+        (self.built / "dashboard/livestock-registry-dashboard-1.0.0-develop.9.tgz").write_text("")
         self.bin = base / "bin"
         self.bin.mkdir()
         for name, body in (("helm", HELM), ("kubectl", KUBECTL)):
@@ -103,7 +108,7 @@ class DeployRollbackTests(unittest.TestCase):
     def run_deploy(self, **env):
         e = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"], LOG=str(self.log),
                  KUBECONFIG="/nonexistent", ECR_REGISTRY="123456789012.dkr.ecr.ap-south-1.amazonaws.com",
-                 IMAGE_TAG="abcdef123456", BUILD_NUMBER="7", DASHBOARD_UI_SHA="deadbeefcafe",
+                 IMAGE_TAG="abcdef123456", BUILD_NUMBER="7", BUILT_CHART_DIR=str(self.built),
                  HISTORY_JSON=DEPLOYED)
         e.update(env)
         out = base_out = Path(self.tmp.name) / "out.txt"
@@ -209,7 +214,17 @@ class DeployRollbackTests(unittest.TestCase):
         rp = re.search(r"(?m)^appVersion: (\S+)$", (ROOT / "helm/openg2p-livestock-registry/Chart.yaml").read_text()).group(1)
         ecr = "123456789012.dkr.ecr.ap-south-1.amazonaws.com/eoan/livestock-registry/"
         self.assertIn("dashboardApi.image.repository=" + ecr + "dashboard-api-" + rp, calls)
-        self.assertIn("deploy-ui livestock livestock " + ecr + "dashboard-ui-" + rp + " abcdef123456", calls)
+
+    def test_the_dashboard_ui_is_installed_from_the_chart_this_build_packaged(self):
+        rc, out, calls = self.run_deploy()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("deploy-ui livestock livestock " + str(self.built / "dashboard"), calls)
+
+    def test_no_dashboard_chart_no_dashboard_deploy(self):
+        shutil.rmtree(str(self.built / "dashboard"))
+        rc, out, calls = self.run_deploy()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("deploy-ui", calls)
 
     def test_the_upgrade_is_marked_started_only_just_before_helm_upgrade(self):
         text = (ROOT / "ci/deploy/deploy-livestock-dev.sh").read_text()
@@ -428,6 +443,22 @@ class PipelineWiringTests(unittest.TestCase):
         self.assertIn('python3 ci/image_names.py repository ${name}', build)
         self.assertIn('def image = "${env.ECR_REGISTRY}/${repository}:${env.IMAGE_TAG}"', build)
         self.assertNotIn("take(12)", self.text)
+
+    def test_the_dashboard_ui_digest_goes_to_package_chart(self):
+        build = self.stage("Build & Push Images", "Stash deploy")
+        self.assertIn("if (env.DASHBOARD_UI_SHA) { digested << ['dashboard-ui', repositories['dashboard-ui']] }", build)
+        self.assertNotIn("DASHBOARD_UI_SHA=", self.stage("Deploy to Development", "Upgrade connector (New Dev)"))
+
+    def test_the_dashboard_chart_is_packaged_only_when_it_may_be_deployed(self):
+        package = (ROOT / "ci/deploy/package-chart.sh").read_text()
+        self.assertIn("printf 'image\\t%s\\t%s@%s\\n'", package)
+        self.assertIn('[ "$(python3 ci/deploy/oan_chart.py is-deployable dashboard dev)" = "true" ]', package)
+        self.assertIn("--output built-chart/dashboard", package)
+        self.assertIn("oan_chart.py values dashboard built-chart/dashboard/values.yaml", package)
+
+    def test_publish_chart_publishes_the_dashboard_chart_too(self):
+        publish = (ROOT / "ci/deploy/publish-chart.sh").read_text()
+        self.assertIn("for archive in built-chart/*.tgz built-chart/dashboard/*.tgz; do", publish)
 
     def test_the_dashboard_images_are_named_by_ci_image_names(self):
         build = self.stage("Build & Push Images", "Stash deploy")

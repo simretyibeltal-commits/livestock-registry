@@ -240,6 +240,8 @@ pipeline {
                         // <repository> and <tag>@<digest> into the packaged copy. component<TAB>repository<TAB>digest
                         def digested = ['staff-api', 'partner-api', 'celery', 'db-seed', 'sanity-tests', 'staff-ui'].collect { [it, repositories[it]] }
                         if (env.DASHBOARD_API_SHA) { digested << ['dashboard-api', repositories['dashboard-api']] }
+                        // The dashboard UI goes into its own chart, packaged and published beside the registry chart.
+                        if (env.DASHBOARD_UI_SHA) { digested << ['dashboard-ui', repositories['dashboard-ui']] }
                         sh """
                             set -eu
                             mkdir -p .build
@@ -374,7 +376,7 @@ EOF
                     script {
                         def deployEnv = [
                             "DEV_NAMESPACE=${DEV_NAMESPACE}", "ECR_REGISTRY=${env.ECR_REGISTRY}",
-                            "IMAGE_TAG=${env.IMAGE_TAG}", "DASHBOARD_UI_SHA=${env.DASHBOARD_UI_SHA}",
+                            "IMAGE_TAG=${env.IMAGE_TAG}",
                             "BUILT_CHART_DIR=${env.WORKSPACE}/built-chart",
                         ]
                         withEnv(deployEnv) {

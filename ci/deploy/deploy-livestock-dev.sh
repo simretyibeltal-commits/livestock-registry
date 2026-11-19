@@ -23,7 +23,7 @@
 #   HELM_RELEASE      default livestock-registry
 #   ECR_REGISTRY      <account>.dkr.ecr.<region>.amazonaws.com
 #   IMAGE_TAG         this build's image tag (every image, the dashboards too)
-#   DASHBOARD_UI_SHA  set when this build built the dashboard UI (ci/dashboard/deploy-ui.sh)
+#   BUILT_CHART_DIR   the charts of 'Package chart'; dashboard/ in it when this build built the dashboard UI
 #   BUILD_NUMBER      names the archived rendered manifests
 set -euo pipefail
 set +x
@@ -38,7 +38,7 @@ HELM_RELEASE="${HELM_RELEASE:-livestock-registry}"
 # eoan/livestock-registry/<component>-<RP version> (ci/image_names.py), resolved before anything is changed: a failed
 # lookup stops here.
 declare -A IMAGE
-for component in staff-api partner-api celery db-seed staff-ui sanity-tests dashboard-api dashboard-ui; do
+for component in staff-api partner-api celery db-seed staff-ui sanity-tests dashboard-api; do
   IMAGE[$component]="${ECR_REGISTRY}/$(python3 ci/image_names.py repository "$component")"
 done
 BUILD_NUMBER="${BUILD_NUMBER:-local}"
@@ -203,8 +203,8 @@ for f in "$WORK/logs/$HELM_RELEASE-sanity"*.log; do
 done
 
 kubectl rollout status "deployment/$HELM_RELEASE-dashboard-api" -n "$DEV_NAMESPACE" --timeout=420s
-if [ -n "${DASHBOARD_UI_SHA:-}" ]; then
-  bash ci/dashboard/deploy-ui.sh livestock "$DEV_NAMESPACE" "${IMAGE[dashboard-ui]}" "$IMAGE_TAG"
+if [ -n "${BUILT_CHART_DIR:-}" ] && [ -d "$BUILT_CHART_DIR/dashboard" ]; then
+  bash ci/dashboard/deploy-ui.sh livestock "$DEV_NAMESPACE" "$BUILT_CHART_DIR/dashboard"
 fi
 for component in staff-portal-api staff-portal-ui partner-api celery-worker celery-beat-producer; do
   kubectl rollout status "deployment/$HELM_RELEASE-$component" -n "$DEV_NAMESPACE" --timeout=180s
