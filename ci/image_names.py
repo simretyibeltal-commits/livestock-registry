@@ -1,6 +1,7 @@
 """The ECR names of the Livestock Registry images: eoan/livestock-registry/<image>-<RP version>:<version>-<branch>.<build>.
 
     eoan/livestock-registry/staff-ui-1.2.2-rc.614:0.0.0-develop.300
+    eoan/oan_livestock_dashboard/dashboard-ui-1.2.2-rc.614:0.0.0-develop.300   (a dashboard, under its own repository)
 
 The RP version is appVersion of helm/openg2p-livestock-registry/Chart.yaml (the OpenG2P registry platform the images
 are built on). The pipeline, the chart packaging and the deploy all take the names from here.
@@ -13,6 +14,9 @@ from pathlib import Path
 
 CHART = Path(__file__).resolve().parents[1] / "helm/openg2p-livestock-registry/Chart.yaml"
 PATH = "eoan/livestock-registry"
+# The dashboards are built from their own GitHub repositories and are named under those, like every eoan image:
+# eoan/<repository>/<image>-<RP version>.
+PATHS = {"dashboard-api": "eoan/livestock-registry-dashbaord-api", "dashboard-ui": "eoan/oan_livestock_dashboard"}
 
 
 def _chart_field(name):
@@ -23,7 +27,7 @@ def _chart_field(name):
 
 
 def repository(image):
-    return "%s/%s-%s" % (PATH, image, _chart_field("appVersion"))
+    return "%s/%s-%s" % (PATHS.get(image, PATH), image, _chart_field("appVersion"))
 
 
 def tag(branch, build):

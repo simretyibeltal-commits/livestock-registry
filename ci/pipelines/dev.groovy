@@ -22,7 +22,7 @@ pipeline {
         AWS_REGION       = 'ap-south-1'
         // Registry images: eoan/livestock-registry/<image>-<RP version>:<version>-<branch>.<build>, named by
         // ci/image_names.py from helm/openg2p-livestock-registry/Chart.yaml. The dashboard images, built from their own
-        // repositories, are named the same way (dashboard-api, dashboard-ui).
+        // repositories, are named under those (eoan/<repository>/dashboard-{api,ui}-<RP version>).
         RP_VERSION       = '1.2.2-rc.614' // Same native platform as the immutable central profile
         HELM_RELEASE     = 'livestock-registry'
         HELM_NAMESPACE   = 'live'

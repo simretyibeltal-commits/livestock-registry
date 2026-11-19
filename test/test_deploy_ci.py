@@ -212,7 +212,8 @@ class DeployRollbackTests(unittest.TestCase):
         rc, out, calls = self.run_deploy()
         self.assertEqual(rc, 0, out)
         rp = re.search(r"(?m)^appVersion: (\S+)$", (ROOT / "helm/openg2p-livestock-registry/Chart.yaml").read_text()).group(1)
-        ecr = "123456789012.dkr.ecr.ap-south-1.amazonaws.com/eoan/livestock-registry/"
+        # Under its own GitHub repository's name, like every eoan image.
+        ecr = "123456789012.dkr.ecr.ap-south-1.amazonaws.com/eoan/livestock-registry-dashbaord-api/"
         self.assertIn("dashboardApi.image.repository=" + ecr + "dashboard-api-" + rp, calls)
 
     def test_the_dashboard_ui_is_installed_from_the_chart_this_build_packaged(self):
