@@ -39,7 +39,7 @@ One pipeline (`ci/pipelines/dev.groovy`). Every `develop` build runs these stage
 `NEW_DEV_DELIVERY_ACTION` choice only carries the deliberate maintenance runs `fresh-install`, `connector-plan` and
 `connector-upgrade`):
 
-1. **Build & Push Images** pushes the images to ECR (`eoan/livestock-registry/<image>-<RP version>:<version>-<branch>.<build>`, named by `ci/image_names.py`) and records each ECR digest in
+1. **Build & Push Images** pushes the images to ECR (`eoan/livestock-registry/<image>-<RP version>:<version>-<branch>.<build>`, named by `ci/image_names.py`; the dashboard-api and dashboard-ui images too) and records each ECR digest in
    `.build/image-digests.tsv`. If this fails nothing after it runs and the log shows why.
 2. **Package chart** (`ci/deploy/package-chart.sh`) packages `helm/openg2p-livestock-registry` with this
    build's images, using `scripts/ci/package_chart.py` of oan-helm. The version comes from git:

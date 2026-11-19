@@ -21,10 +21,8 @@ pipeline {
     environment {
         AWS_REGION       = 'ap-south-1'
         // Registry images: eoan/livestock-registry/<image>-<RP version>:<version>-<branch>.<build>, named by
-        // ci/image_names.py from helm/openg2p-livestock-registry/Chart.yaml. The dashboard images come from their own
-        // repositories and keep their names.
-        DASHBOARD_API_ECR = 'openg2p/livestock-registry/dashboard-api'
-        DASHBOARD_UI_ECR = 'openg2p/livestock-registry/dashboard-ui'
+        // ci/image_names.py from helm/openg2p-livestock-registry/Chart.yaml. The dashboard images, built from their own
+        // repositories, are named the same way (dashboard-api, dashboard-ui).
         RP_VERSION       = '1.2.2-rc.614' // Same native platform as the immutable central profile
         HELM_RELEASE     = 'livestock-registry'
         HELM_NAMESPACE   = 'live'
@@ -199,8 +197,21 @@ pipeline {
                             }
                         }
 
+                        // The dashboards that were checked out (none on staging), with their ECR repositories made.
+                        def dashboards = ['dashboard-ui': env.DASHBOARD_UI_SHA, 'dashboard-api': env.DASHBOARD_API_SHA]
+                        dashboards.each { name, sha ->
+                            if (sha) {
+                                def repository = sh(returnStdout: true, script: "python3 ci/image_names.py repository ${name}").trim()
+                                repositories[name] = repository
+                                sh """
+                                    aws ecr describe-repositories --region ${AWS_REGION} --repository-names ${repository} > /dev/null 2>&1 \
+                                      || aws ecr create-repository --region ${AWS_REGION} --repository-name ${repository} \
+                                           --image-scanning-configuration scanOnPush=true > /dev/null
+                                """
+                            }
+                        }
                         if (env.DASHBOARD_UI_SHA) {
-                            def ui = "${env.ECR_REGISTRY}/${DASHBOARD_UI_ECR}:${env.DASHBOARD_UI_SHA}"
+                            def ui = "${env.ECR_REGISTRY}/${repositories['dashboard-ui']}:${env.IMAGE_TAG}"
                             sh """
                                 docker build --label org.opencontainers.image.revision=${env.DASHBOARD_UI_SHA} \
                                   -f .build/dashboard-ui/Dockerfile -t ${ui} .build/dashboard-ui
@@ -211,9 +222,8 @@ pipeline {
                         if (env.DASHBOARD_API_SHA) {
                             // The dashboard service, from its own repository (cloned
                             // by 'Checkout dashboard-api'), with its own build context.
-                            // Its ECR repository is created outside CI, like the others.
-                            def api = "${env.ECR_REGISTRY}/${DASHBOARD_API_ECR}:${env.IMAGE_TAG}"
-                            def apiCache = "${env.ECR_REGISTRY}/${DASHBOARD_API_ECR}:cache-${env.BRANCH_NAME}"
+                            def api = "${env.ECR_REGISTRY}/${repositories['dashboard-api']}:${env.IMAGE_TAG}"
+                            def apiCache = "${env.ECR_REGISTRY}/${repositories['dashboard-api']}:cache-${env.BRANCH_NAME}"
                             sh """
                                 echo "=== Building and pushing dashboard-api (${env.DASHBOARD_API_REF_USED} @ ${env.DASHBOARD_API_SHA}) ==="
                                 docker build --build-arg BUILDKIT_INLINE_CACHE=1 --cache-from ${apiCache} \
@@ -229,7 +239,7 @@ pipeline {
                         // The ECR repository and digest of every image the chart carries: 'Package chart' writes
                         // <repository> and <tag>@<digest> into the packaged copy. component<TAB>repository<TAB>digest
                         def digested = ['staff-api', 'partner-api', 'celery', 'db-seed', 'sanity-tests', 'staff-ui'].collect { [it, repositories[it]] }
-                        if (env.DASHBOARD_API_SHA) { digested << ['dashboard-api', DASHBOARD_API_ECR] }
+                        if (env.DASHBOARD_API_SHA) { digested << ['dashboard-api', repositories['dashboard-api']] }
                         sh """
                             set -eu
                             mkdir -p .build
@@ -363,8 +373,8 @@ EOF
                 withCredentials([file(credentialsId: "${DEV_KUBECONFIG_CRED_ID}", variable: 'KUBECONFIG')]) {
                     script {
                         def deployEnv = [
-                            "DEV_NAMESPACE=${DEV_NAMESPACE}", "ECR_REGISTRY=${env.ECR_REGISTRY}", "DASHBOARD_API_ECR=${DASHBOARD_API_ECR}",
-                            "IMAGE_TAG=${env.IMAGE_TAG}", "DASHBOARD_UI_ECR=${DASHBOARD_UI_ECR}", "DASHBOARD_UI_SHA=${env.DASHBOARD_UI_SHA}",
+                            "DEV_NAMESPACE=${DEV_NAMESPACE}", "ECR_REGISTRY=${env.ECR_REGISTRY}",
+                            "IMAGE_TAG=${env.IMAGE_TAG}", "DASHBOARD_UI_SHA=${env.DASHBOARD_UI_SHA}",
                             "BUILT_CHART_DIR=${env.WORKSPACE}/built-chart",
                         ]
                         withEnv(deployEnv) {

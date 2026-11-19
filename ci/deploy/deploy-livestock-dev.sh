@@ -22,9 +22,8 @@
 #   DEV_NAMESPACE     default livestock
 #   HELM_RELEASE      default livestock-registry
 #   ECR_REGISTRY      <account>.dkr.ecr.<region>.amazonaws.com
-#   DASHBOARD_API_ECR default openg2p/livestock-registry/dashboard-api (the registry images: ci/image_names.py)
-#   IMAGE_TAG         this build's image tag
-#   DASHBOARD_UI_ECR, DASHBOARD_UI_SHA  dashboard UI image (ci/dashboard/deploy-ui.sh)
+#   IMAGE_TAG         this build's image tag (every image, the dashboards too)
+#   DASHBOARD_UI_SHA  set when this build built the dashboard UI (ci/dashboard/deploy-ui.sh)
 #   BUILD_NUMBER      names the archived rendered manifests
 set -euo pipefail
 set +x
@@ -36,11 +35,10 @@ cd "$REPO_ROOT"
 : "${IMAGE_TAG:?set IMAGE_TAG}"
 DEV_NAMESPACE="${DEV_NAMESPACE:-livestock}"
 HELM_RELEASE="${HELM_RELEASE:-livestock-registry}"
-DASHBOARD_API_ECR="${DASHBOARD_API_ECR:-openg2p/livestock-registry/dashboard-api}"
 # eoan/livestock-registry/<component>-<RP version> (ci/image_names.py), resolved before anything is changed: a failed
 # lookup stops here.
 declare -A IMAGE
-for component in staff-api partner-api celery db-seed staff-ui sanity-tests; do
+for component in staff-api partner-api celery db-seed staff-ui sanity-tests dashboard-api dashboard-ui; do
   IMAGE[$component]="${ECR_REGISTRY}/$(python3 ci/image_names.py repository "$component")"
 done
 BUILD_NUMBER="${BUILD_NUMBER:-local}"
@@ -122,7 +120,7 @@ IMAGE_SET_FLAGS=(
   --set "registry.sanity.image.repository=${IMAGE[sanity-tests]}"
   --set-string "registry.sanity.image.tag=${IMAGE_TAG}"
   --set dashboardApi.enabled=true
-  --set "dashboardApi.image.repository=${ECR_REGISTRY}/${DASHBOARD_API_ECR}"
+  --set "dashboardApi.image.repository=${IMAGE[dashboard-api]}"
   --set-string "dashboardApi.image.tag=${IMAGE_TAG}"
   --set-string "dashboardApi.image.digest=${DASHBOARD_API_DIGEST}"
   --set reporting.views.enabled=true
@@ -206,7 +204,7 @@ done
 
 kubectl rollout status "deployment/$HELM_RELEASE-dashboard-api" -n "$DEV_NAMESPACE" --timeout=420s
 if [ -n "${DASHBOARD_UI_SHA:-}" ]; then
-  bash ci/dashboard/deploy-ui.sh livestock "$DEV_NAMESPACE" "${ECR_REGISTRY}/${DASHBOARD_UI_ECR:?set DASHBOARD_UI_ECR}" "$DASHBOARD_UI_SHA"
+  bash ci/dashboard/deploy-ui.sh livestock "$DEV_NAMESPACE" "${IMAGE[dashboard-ui]}" "$IMAGE_TAG"
 fi
 for component in staff-portal-api staff-portal-ui partner-api celery-worker celery-beat-producer; do
   kubectl rollout status "deployment/$HELM_RELEASE-$component" -n "$DEV_NAMESPACE" --timeout=180s

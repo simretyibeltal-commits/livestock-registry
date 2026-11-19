@@ -65,7 +65,7 @@ if os.path.exists("guard.count"):
 open("guard.count", "w").write(str(n))
 sys.exit(1 if str(n) == os.environ.get("GUARD_FAIL_ON") else 0)
 '''
-DASHBOARD_STUB = '#!/usr/bin/env bash\nexit "${DASHBOARD_UI_RC:-0}"\n'
+DASHBOARD_STUB = '#!/usr/bin/env bash\necho "deploy-ui $*" >> "$LOG"\nexit "${DASHBOARD_UI_RC:-0}"\n'
 
 DEPLOYED = json.dumps([{"revision": 2, "status": "superseded"},
                        {"revision": 3, "status": "deployed", "chart": "openg2p-livestock-registry-1.0.0-dev.19"},
@@ -103,7 +103,7 @@ class DeployRollbackTests(unittest.TestCase):
     def run_deploy(self, **env):
         e = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"], LOG=str(self.log),
                  KUBECONFIG="/nonexistent", ECR_REGISTRY="123456789012.dkr.ecr.ap-south-1.amazonaws.com",
-                 IMAGE_TAG="abcdef123456", BUILD_NUMBER="7", DASHBOARD_UI_ECR="openg2p/x", DASHBOARD_UI_SHA="deadbeefcafe",
+                 IMAGE_TAG="abcdef123456", BUILD_NUMBER="7", DASHBOARD_UI_SHA="deadbeefcafe",
                  HISTORY_JSON=DEPLOYED)
         e.update(env)
         out = base_out = Path(self.tmp.name) / "out.txt"
@@ -202,6 +202,14 @@ class DeployRollbackTests(unittest.TestCase):
         self.assertIn("registry.staffApi.image.repository=123456789012.dkr.ecr.ap-south-1.amazonaws.com/"
                       "eoan/livestock-registry/staff-api-" + rp, calls)
         self.assertNotIn("helm rollback", calls)
+
+    def test_the_dashboard_images_are_named_by_ci_image_names(self):
+        rc, out, calls = self.run_deploy()
+        self.assertEqual(rc, 0, out)
+        rp = re.search(r"(?m)^appVersion: (\S+)$", (ROOT / "helm/openg2p-livestock-registry/Chart.yaml").read_text()).group(1)
+        ecr = "123456789012.dkr.ecr.ap-south-1.amazonaws.com/eoan/livestock-registry/"
+        self.assertIn("dashboardApi.image.repository=" + ecr + "dashboard-api-" + rp, calls)
+        self.assertIn("deploy-ui livestock livestock " + ecr + "dashboard-ui-" + rp + " abcdef123456", calls)
 
     def test_the_upgrade_is_marked_started_only_just_before_helm_upgrade(self):
         text = (ROOT / "ci/deploy/deploy-livestock-dev.sh").read_text()
@@ -420,6 +428,16 @@ class PipelineWiringTests(unittest.TestCase):
         self.assertIn('python3 ci/image_names.py repository ${name}', build)
         self.assertIn('def image = "${env.ECR_REGISTRY}/${repository}:${env.IMAGE_TAG}"', build)
         self.assertNotIn("take(12)", self.text)
+
+    def test_the_dashboard_images_are_named_by_ci_image_names(self):
+        build = self.stage("Build & Push Images", "Stash deploy")
+        self.assertNotIn("DASHBOARD_API_ECR", self.text)
+        self.assertNotIn("DASHBOARD_UI_ECR", self.text)
+        self.assertIn("components.each { name ->", build)
+        self.assertIn("def dashboards = ['dashboard-ui': env.DASHBOARD_UI_SHA, 'dashboard-api': env.DASHBOARD_API_SHA]", build)
+        self.assertIn('def ui = "${env.ECR_REGISTRY}/${repositories[\'dashboard-ui\']}:${env.IMAGE_TAG}"', build)
+        self.assertIn('def api = "${env.ECR_REGISTRY}/${repositories[\'dashboard-api\']}:${env.IMAGE_TAG}"', build)
+        self.assertIn("digested << ['dashboard-api', repositories['dashboard-api']]", build)
 
     def test_the_chart_takes_each_image_s_repository_from_the_digest_file(self):
         package = (ROOT / "ci/deploy/package-chart.sh").read_text()
